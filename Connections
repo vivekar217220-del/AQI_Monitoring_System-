@@ -1,0 +1,37 @@
+Connection Table :- 
+
++------------+--------------+----------------+------------------------------------+
+| Part       | Pin          | Connect to     | Notes                              |
++------------+--------------+----------------+------------------------------------+
+| MQ-7       | VCC          | VIN (5 V)      | Heater needs 5 V, not 3V3          |
+| MQ-7       | GND          | GND            | Common ground                      |
+| MQ-7       | AO           | 10k #1 (top)   | Analog output                      |
+| MQ-7       | DO           | not connected  |                                    |
++------------+--------------+----------------+------------------------------------+
+| 10k #1     | other end    | GPIO34         | Middle point to ADC                |
+| 10k #2     | one end      | GPIO34         | Middle point to ADC                |
+| 10k #2     | other end    | GND            | Bottom of divider                  |
++------------+--------------+----------------+------------------------------------+
+| DHT11      | + (VCC)      | 3V3            | Power                              |
+| DHT11      | S (DATA)     | GPIO4          | Data line                          |
+| DHT11      | - (GND)      | GND            | Common ground                      |
++------------+--------------+----------------+------------------------------------+
+| OLED       | VCC          | 3V3            | Power                              |
+| OLED       | GND          | GND            | Common ground                      |
+| OLED       | SDA          | GPIO21         | I2C data                           |
+| OLED       | SCL          | GPIO22         | I2C clock                          |
++------------+--------------+----------------+------------------------------------+
+| RGB LED    | R            | GPIO26         | 220 ohm if no built-in resistor    |
+| RGB LED    | G            | GPIO27         | Same as R                          |
+| RGB LED    | B            | GPIO14         | Same as R                          |
+| RGB LED    | - (common)   | GND            | Common cathode                     |
++------------+--------------+----------------+------------------------------------+
+| Buzzer     | +            | GPIO25         | Direct, pulsed alarm               |
+| Buzzer     | -            | GND            | Common ground                      |
++------------+--------------+----------------+------------------------------------+
+
+MQ-7 divider:
+
+MQ-7 AO ---[ 10k #1 ]---+---[ 10k #2 ]--- GND
+                        |
+                     GPIO34
