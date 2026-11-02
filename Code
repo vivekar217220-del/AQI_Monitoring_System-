@@ -1,0 +1,338 @@
+/*Currently This project using the MQ-7 CO sensor than PM2.5 Random Generation and than using DHT11 readings of Temperature and the Humidity value's
+accordingly it calculate the AQI and readings and other indications are done in the RGB Active modeule than Buzzer and the OLED Display for printing It  */
+
+/*
+ * AQI OUTPUT ONLY - Wi-Fi connection + sensor data on the Serial Monitor and the OLED
+ * No MQTT, no HTTP, no cloud. Protocols will be added later.
+ *
+ * Sensors:   DHT11 (GPIO4), MQ-7 AO (GPIO34, through a 10k / 10k divider)
+ * Simulated: PM2.5 (random walk) until a PMS5003 is connected
+ * Outputs:   Serial Monitor (115200 baud), 0.96" OLED (SSD1306, SDA 21, SCL 22)
+ *            RGB LED (R 26, G 27, B 14), buzzer (GPIO25)
+ *
+ * Libraries: DHT sensor library, Adafruit SSD1306, Adafruit GFX Library
+ * Board:     ESP32 Dev Module
+ */
+
+#include <WiFi.h>
+#include <DHT.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ===== EDIT THESE =====
+const char* WIFI_SSID = "YOUR_WIFI_SSID";    // the network the ESP32 joins (must be 2.4 GHz)
+const char* WIFI_PASS = "YOUR_PASSWORD";     // its password (the one that worked in your last upload)
+const int   ALERT_AQI = 100;                 // red LED and buzzer at or above this AQI
+const bool  BUZZER_PULSED = true;            // true = beeping pattern, false = steady tone
+const bool  RGB_COMMON_ANODE = false;        // true if the colours look inverted
+const unsigned long READ_INTERVAL_MS = 10000;  // one full report every 10 s
+const unsigned long CO_WARMUP_MS = 120000;     // MQ-7 needs about 2 minutes
+const float RL_OHM = 10000.0;                // MQ-7 load resistor (10 kOhm on most boards)
+const float VCC_MQ = 5.0;                    // MQ-7 supply voltage
+const int   BASELINE_READINGS = 6;           // readings used for the clean-air baseline R0
+
+// ===== PINS =====
+#define PIN_MQ7     34
+#define PIN_DHT      4
+#define DHTTYPE     DHT11
+#define PIN_BUZZER  25
+#define PIN_RGB_R   26
+#define PIN_RGB_G   27
+#define PIN_RGB_B   14
+#define OLED_ADDR   0x3C                     // try 0x3D if the screen stays blank
+
+DHT dht(PIN_DHT, DHTTYPE);
+Adafruit_SSD1306 display(128, 64, &Wire, -1);
+
+bool oledOK = false;
+unsigned long seq = 0;
+unsigned long bootTime = 0;
+unsigned long lastRead = 0;
+unsigned long lastUi = 0;
+unsigned long alarmTimer = 0;
+bool buzzerState = false;
+bool alarmOn = false;
+float r0 = 0, r0Sum = 0;
+int baselineCount = 0;
+float pmState = 40.0;                        // simulated PM2.5 starting point
+
+// Last values, shown on the OLED
+float lastPM = 0, lastTemp = NAN, lastHum = NAN, lastCO = 0, lastFan = 0;
+int lastAQI = 0;
+const char* lastCat = "--";
+
+// ---------- Simulated PM2.5 (random walk, replace with the PMS5003 reading later) ----------
+float simulatePM25() {
+  pmState += random(-80, 81) / 10.0;         // -8.0 to +8.0 ug/m3 per reading
+  if (random(0, 100) < 3) {                  // 3% of readings: a spike or a drop
+    pmState += random(-1, 2) * 40.0;
+  }
+  if (pmState < 5.0)   pmState = 5.0;
+  if (pmState > 250.0) pmState = 250.0;
+  return pmState;
+}
+
+// ---------- AQI (CPCB breakpoints, PM2.5 only) ----------
+struct Band { float cLo, cHi; int iLo, iHi; };
+const Band PM25_BANDS[] = {
+  {0, 30, 0, 50}, {31, 60, 51, 100}, {61, 90, 101, 200},
+  {91, 120, 201, 300}, {121, 250, 301, 400}, {251, 500, 401, 500}
+};
+
+int calcAQI(float c) {
+  for (const Band& b : PM25_BANDS) {
+    if (c <= b.cHi) {
+      return (int)((b.iHi - b.iLo) * (c - b.cLo) / (b.cHi - b.cLo) + b.iLo + 0.5);
+    }
+  }
+  return 500;
+}
+
+const char* category(int aqi) {
+  if (aqi <= 50)  return "Good";
+  if (aqi <= 100) return "Satisfactory";
+  if (aqi <= 200) return "Moderate";
+  if (aqi <= 300) return "Poor";
+  if (aqi <= 400) return "Very Poor";
+  return "Severe";
+}
+
+// ---------- Fuzzy fan speed (PM2.5 -> purifier fan %) ----------
+// Low -> 20 %, Medium -> 60 %, High -> 100 %, combined as a weighted average.
+float triangle(float x, float a, float b, float c) {
+  if (x <= a || x >= c) return 0;
+  if (x <= b) return (x - a) / (b - a);
+  return (c - x) / (c - b);
+}
+
+float fanSpeedFuzzy(float pm) {
+  float low  = (pm <= 30) ? 1.0 : (pm >= 60 ? 0.0 : (60.0 - pm) / 30.0);
+  float med  = triangle(pm, 30, 75, 120);
+  float high = (pm >= 150) ? 1.0 : (pm <= 90 ? 0.0 : (pm - 90.0) / 60.0);
+  float total = low + med + high;
+  if (total <= 0) return 0;
+  return (low * 20.0 + med * 60.0 + high * 100.0) / total;
+}
+
+// ---------- RGB LED and buzzer ----------
+void setRGB(bool r, bool g, bool b) {
+  int on  = RGB_COMMON_ANODE ? LOW  : HIGH;
+  int off = RGB_COMMON_ANODE ? HIGH : LOW;
+  digitalWrite(PIN_RGB_R, r ? on : off);
+  digitalWrite(PIN_RGB_G, g ? on : off);
+  digitalWrite(PIN_RGB_B, b ? on : off);
+}
+
+// Green up to AQI 50, yellow below the alert level, red at or above it
+void showCategoryColour(int aqi) {
+  if (aqi <= 50)            setRGB(false, true, false);   // Good: green
+  else if (aqi < ALERT_AQI) setRGB(true, true, false);    // Satisfactory: yellow
+  else                      setRGB(true, false, false);   // High AQI: red
+}
+
+void rgbSelfTest() {
+  setRGB(true, false, false);  delay(300);
+  setRGB(false, true, false);  delay(300);
+  setRGB(false, false, true);  delay(300);
+  setRGB(false, false, false);
+}
+
+void beep(int times) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(PIN_BUZZER, HIGH); delay(150);
+    digitalWrite(PIN_BUZZER, LOW);  delay(150);
+  }
+}
+
+// Runs on every loop, so the buzzer keeps sounding between readings
+void updateAlarm() {
+  if (!alarmOn) {
+    digitalWrite(PIN_BUZZER, LOW);
+    return;
+  }
+  if (!BUZZER_PULSED) {
+    digitalWrite(PIN_BUZZER, HIGH);
+    return;
+  }
+  if (millis() - alarmTimer >= 400) {          // 400 ms on, 400 ms off
+    alarmTimer = millis();
+    buzzerState = !buzzerState;
+    digitalWrite(PIN_BUZZER, buzzerState ? HIGH : LOW);
+  }
+}
+
+// ---------- OLED ----------
+String fmt(float v, int digits) {
+  return isnan(v) ? String("--") : String(v, digits);
+}
+
+void showMessage(const String& line1, const String& line2 = "") {
+  if (!oledOK) return;
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println(line1);
+  display.setCursor(0, 16);
+  display.println(line2);
+  display.display();
+}
+
+void updateDisplay() {
+  if (!oledOK) return;
+  if (seq == 0) {
+    showMessage("Starting...", "first reading in 10 s");
+    return;
+  }
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("AQI " + String(lastAQI) + "  " + String(lastCat));
+  display.println("PM2.5 " + fmt(lastPM, 1) + " Fan " + String((int)lastFan) + "%");
+  display.println("T " + fmt(lastTemp, 1) + "C  H " + fmt(lastHum, 0) + "%");
+  unsigned long up = millis() - bootTime;
+  if (up < CO_WARMUP_MS) {
+    display.println("CO warming " + String((CO_WARMUP_MS - up) / 1000) + " s");
+  } else {
+    display.println("CO " + fmt(lastCO, 2) + " V");
+  }
+  display.println("RSSI " + String(WiFi.RSSI()) + " dBm  seq " + String(seq));
+  display.display();
+}
+
+// ---------- Wi-Fi: scans first, retries, and reports why it fails ----------
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  while (WiFi.status() != WL_CONNECTED) {
+    showMessage("WiFi connecting", WIFI_SSID);
+    Serial.println("Scanning for " + String(WIFI_SSID) + " ...");
+    int n = WiFi.scanNetworks();
+    bool found = false;
+    for (int i = 0; i < n; i++) {
+      if (WiFi.SSID(i) == String(WIFI_SSID)) found = true;
+    }
+    if (!found) {
+      Serial.println("  not found among " + String(n) + " networks. Check the name and 2.4 GHz. Retrying...");
+      showMessage("SSID not found", "check name, 2.4 GHz");
+      delay(5000);
+      continue;
+    }
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
+      delay(300);
+    }
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("  connect failed (status " + String((int)WiFi.status()) + "). Check the password. Retrying...");
+      WiFi.disconnect();
+      delay(2000);
+    }
+  }
+  Serial.println("WiFi OK. IP " + WiFi.localIP().toString());
+  showMessage("WiFi OK", WiFi.localIP().toString());
+}
+
+// ---------- DHT11: retries up to 3 times, because it needs about 2 s between reads ----------
+bool readDHT(float& t, float& h) {
+  for (int i = 0; i < 3; i++) {
+    t = dht.readTemperature();
+    h = dht.readHumidity();
+    if (!isnan(t) && !isnan(h)) return true;
+    delay(2000);
+  }
+  return false;
+}
+
+// ---------- One full reading: sensors -> AQI -> fan -> alarm -> OLED -> Serial ----------
+void takeReading() {
+  seq++;
+
+  float pm25 = simulatePM25();
+  int aqi = calcAQI(pm25);
+  const char* cat = category(aqi);
+  float fan = fanSpeedFuzzy(pm25);
+
+  float temp = NAN, hum = NAN;
+  bool dhtOK = readDHT(temp, hum);
+
+  int mqRaw = analogRead(PIN_MQ7);                          // 0 to 4095
+  float coVolt = mqRaw / 4095.0 * 3.3 * 2.0;                // AO voltage (undo the divider)
+  // MQ-7 sensor resistance: Rs = RL * (Vc - Vout) / Vout
+  float rs = (coVolt > 0.01 && coVolt < VCC_MQ) ? RL_OHM * (VCC_MQ - coVolt) / coVolt : 0;
+  // Clean-air baseline R0 = average Rs of the first readings after warm-up
+  if (millis() - bootTime >= CO_WARMUP_MS && baselineCount < BASELINE_READINGS && rs > 0) {
+    r0Sum += rs;
+    baselineCount++;
+    if (baselineCount == BASELINE_READINGS) r0 = r0Sum / BASELINE_READINGS;
+  }
+  float rsRatio = (r0 > 0 && rs > 0) ? rs / r0 : 0;
+
+  alarmOn = aqi >= ALERT_AQI;
+  showCategoryColour(aqi);
+
+  lastPM = pm25; lastAQI = aqi; lastCat = cat; lastFan = fan;
+  lastTemp = temp; lastHum = hum; lastCO = coVolt;
+  updateDisplay();
+
+  // ----- Full report on the Serial Monitor -----
+  long rssi = WiFi.RSSI();
+  String sig = (rssi >= -60) ? "good" : ((rssi >= -70) ? "fair" : "weak");
+  Serial.println();
+  Serial.println("========== seq " + String(seq) + "   uptime " + String((millis() - bootTime) / 1000) + " s ==========");
+  Serial.println("WiFi    : " + String(WIFI_SSID) + "   RSSI " + String(rssi) + " dBm (" + sig + ")   IP " + WiFi.localIP().toString());
+  if (dhtOK) {
+    Serial.println("DHT11   : temperature " + fmt(temp, 1) + " C   humidity " + fmt(hum, 0) + " %   (ok)");
+  } else {
+    Serial.println("DHT11   : NO READING after 3 tries  -> check DATA on GPIO4, VCC on 3V3, GND");
+  }
+  Serial.println("MQ-7    : ADC raw " + String(mqRaw) + "   AO " + fmt(coVolt, 2) + " V   Rs " + fmt(rs / 1000.0, 1) + " kOhm   Rs/R0 " + (r0 > 0 ? fmt(rsRatio, 2) : String("calibrating")) + (mqRaw < 5 ? "   -> NO SIGNAL: check AO, VIN, divider" : ""));
+  Serial.println("PM2.5   : " + fmt(pm25, 1) + " ug/m3 (simulated)   fan " + String((int)fan) + " %");
+  Serial.println("AQI     : " + String(aqi) + "  " + String(cat) + "   (CPCB, from PM2.5)");
+  Serial.println("ALERT   : " + (alarmOn ? String("HIGH: RGB red, buzzer on") : String("normal: RGB ") + (aqi <= 50 ? "green" : "yellow")));
+  Serial.println("================================================================");
+}
+
+// ---------- Setup and loop ----------
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println();
+  Serial.println("===== AQI OUTPUT ONLY (Wi-Fi + sensors, no protocols) =====");
+
+  pinMode(PIN_BUZZER, OUTPUT);
+  digitalWrite(PIN_BUZZER, LOW);
+  pinMode(PIN_RGB_R, OUTPUT);
+  pinMode(PIN_RGB_G, OUTPUT);
+  pinMode(PIN_RGB_B, OUTPUT);
+
+  dht.begin();
+  Wire.begin(21, 22);
+  oledOK = display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
+  if (!oledOK) Serial.println("OLED not found. Check wiring, or try address 0x3D.");
+
+  randomSeed(micros());
+  bootTime = millis();
+
+  rgbSelfTest();
+  beep(1);
+  connectWiFi();
+  updateDisplay();
+}
+
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) connectWiFi();
+
+  updateAlarm();
+
+  if (seq == 0 || millis() - lastRead >= READ_INTERVAL_MS) {
+    lastRead = millis();
+    takeReading();
+  }
+
+  if (millis() - lastUi >= 1000) {             // refresh the OLED once a second
+    lastUi = millis();
+    updateDisplay();
+  }
+}
