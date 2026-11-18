@@ -18,4 +18,4 @@ An ESP32 prototype that displays environmental readings and uses simulated PM2.5
 2. Open the [source](Code) as an Arduino sketch for **ESP32 Dev Module**. Install the DHT sensor, Adafruit SSD1306, and Adafruit GFX libraries.
 3. Configure the Wi-Fi placeholders for a local 2.4 GHz network. Upload and open the Serial Monitor at **115200 baud**.
 
-The checked-in sketch connects to Wi-Fi and reports locally. The HTTP and MQTT recordings show separate data-sharing experiments.
+The checked-in sketch connects to Wi-Fi and reports locally. The HTTP and MQTT recordings show separate data-sharing experiments. The project is ongoing, with a web dashboard planned for viewing and analyzing AQI readings.
